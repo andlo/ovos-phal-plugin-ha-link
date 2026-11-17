@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ovos-phal-plugin-ha-link"
+version = "0.1.0a1"
+description = "OpenVoiceOS PHAL plugin: links the device to Home Assistant - it connects itself and carries its bus to the OpenVoiceOS integration"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [{name = "Andreas Lorensen"}]
+requires-python = ">=3.10"
+keywords = ["ovos", "openvoiceos", "plugin", "phal", "home-assistant", "homeassistant", "assist"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "ovos-plugin-manager>=0.0.26",
+    "ovos-utils>=0.0.38",
+    "ovos-bus-client>=0.0.8",
+    "aiohttp>=3.9",
+]
+
+[project.urls]
+Homepage = "https://github.com/andlo/ovos-phal-plugin-ha-link"
+Issues = "https://github.com/andlo/ovos-phal-plugin-ha-link/issues"
+"Home Assistant integration" = "https://github.com/andlo/ha-ovos-integration"
+
+[project.entry-points."opm.phal"]
+ovos-phal-plugin-ha-link = "ovos_phal_plugin_ha_link:HALinkPlugin"
+
+[tool.setuptools]
+packages = ["ovos_phal_plugin_ha_link"]
