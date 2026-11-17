@@ -74,6 +74,8 @@ reboot ([ha-ovos-integration#15](https://github.com/andlo/ha-ovos-integration/is
 Home Assistant's requests come through this link, and the plugin calls the
 panel here on the device, so the panel never has to be opened on the network.
 Restart and reboot need the panel's access token (`webui.access_token`).
+The panel's backup goes to Home Assistant too (its **Take backup** button):
+as a file in one message, base64, up to about 3 MB.
 
 ## Home Assistant's Assist
 

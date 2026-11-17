@@ -8,9 +8,11 @@ when HA restarts or the network drops.
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections.abc import Callable
 import itertools
 import json
+import re
 import threading
 from typing import Any
 
@@ -19,6 +21,9 @@ from ovos_utils.log import LOG
 
 PROTOCOL = 1
 RETRY_SECONDS = 10
+# a file for HA (the panel's backup) goes in one WebSocket message: HA takes
+# 4 MB, and base64 makes it a third bigger
+MAX_FILE = 3 * 1024 * 1024 - 64 * 1024
 
 
 class HALink:
@@ -190,16 +195,35 @@ class HALink:
                 async with self._session.request(
                         method, f"{self.panel_url}/api{path}", headers=headers,
                         json=event.get("body") if method != "GET" else None,
-                        timeout=aiohttp.ClientTimeout(total=25)) as r:
+                        timeout=aiohttp.ClientTimeout(total=80 if event.get("binary") else 25)) as r:
                     status = r.status
-                    try:
-                        body = await r.json(content_type=None)
-                    except ValueError:
-                        body = {"detail": (await r.text())[:500]}
+                    if event.get("binary") and status < 400:
+                        body = await self._file(r)
+                        if body is None:
+                            status, body = 413, {"detail": "the file is too big to send to Home Assistant"}
+                    else:
+                        try:
+                            body = await r.json(content_type=None)
+                        except ValueError:
+                            body = {"detail": (await r.text())[:500]}
             except (aiohttp.ClientError, OSError, TimeoutError) as e:
                 status, body = 502, {"detail": f"the control panel did not answer: {e}"}
         self._send({"type": "ovos/panel/response", "device_id": self.device["device_id"],
                     "request_id": event.get("id"), "status": status, "body": body})
+
+    @staticmethod
+    async def _file(r: aiohttp.ClientResponse) -> dict[str, Any] | None:
+        """A file answer (the panel's backup) as JSON: base64, with its
+        name. None when it wouldn't fit in one of HA's WebSocket messages
+        (4 MB)."""
+        data = await r.read()
+        if len(data) > MAX_FILE:
+            return None
+        disposition = r.headers.get("Content-Disposition", "")
+        match = re.search(r'filename="?([^";]+)"?', disposition)
+        return {"content_type": r.headers.get("Content-Type", "application/octet-stream"),
+                "filename": match.group(1) if match else None,
+                "data": base64.b64encode(data).decode()}
 
     def _send(self, msg: dict[str, Any]) -> None:
         if self._ws is not None and not self._ws.closed:
