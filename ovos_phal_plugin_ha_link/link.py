@@ -33,6 +33,8 @@ class HALink:
         self.on_event = on_event or (lambda e: None)
         self.forward: set[str] = set()  # the types HA wants (ready event)
         self.ready = False
+        self.ha_device_id: str | None = None   # HA's own id for this device
+        self._results: dict[int, asyncio.Future] = {}
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._ids = itertools.count(1)
         self._connect_id: int | None = None
@@ -64,6 +66,23 @@ class HALink:
         """Any other command for HA (thread-safe), e.g. the control panel's answers."""
         self._loop.call_soon_threadsafe(self._send, msg)
 
+    def call(self, msg: dict[str, Any], timeout: float = 10) -> Any:
+        """A command for HA, waiting for its result (thread-safe, blocking).
+        Raises on an error or when HA isn't there."""
+        if self._ws is None or self._ws.closed:
+            raise ConnectionError("not connected to Home Assistant")
+        return asyncio.run_coroutine_threadsafe(self._call(msg), self._loop).result(timeout)
+
+    async def _call(self, msg: dict[str, Any]) -> Any:
+        msg_id = next(self._ids)
+        fut = self._loop.create_future()
+        self._results[msg_id] = fut
+        try:
+            await self._ws.send_json({"id": msg_id, **msg})
+            return await fut
+        finally:
+            self._results.pop(msg_id, None)
+
     # --- the loop ---------------------------------------------------------
 
     def _run(self) -> None:
@@ -82,6 +101,7 @@ class HALink:
             except PermissionError as e:
                 LOG.error(f"ha-link: {e}")
             self.ready = False
+            self.on_event({"type": "lost"})
             await asyncio.sleep(RETRY_SECONDS)
 
     async def _connect_once(self) -> None:
@@ -106,6 +126,14 @@ class HALink:
                 if raw.type != aiohttp.WSMsgType.TEXT:
                     continue
                 msg = json.loads(raw.data)
+                if msg.get("type") == "result" and msg.get("id") in self._results:
+                    fut = self._results[msg["id"]]
+                    if not fut.done():
+                        if msg.get("success"):
+                            fut.set_result(msg.get("result"))
+                        else:
+                            fut.set_exception(RuntimeError((msg.get("error") or {}).get("message", "error")))
+                    continue
                 if msg.get("id") != self._connect_id:
                     if msg.get("type") == "result" and not msg.get("success"):
                         LOG.debug(f"ha-link: HA refused a command: {msg.get('error')}")
@@ -124,6 +152,7 @@ class HALink:
                          "(Settings -> Devices & services -> Discovered)")
             case "ready":
                 self.forward = set(event.get("forward", []))
+                self.ha_device_id = event.get("device_id")
                 self.ready = True
                 LOG.info(f"ha-link: ready, {len(self.forward)} message types go to Home Assistant")
             case "bus":

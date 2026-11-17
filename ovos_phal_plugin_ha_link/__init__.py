@@ -90,8 +90,13 @@ class HALinkPlugin(PHALPlugin):
                 panel_token = None
         if self.config.get("panel_public_url"):
             info["panel_url"] = self.config["panel_public_url"]
-        self.link = HALink(url, token, info, on_bus=self._from_ha,
+        self.link = HALink(url, token, info, on_bus=self._from_ha, on_event=self._on_link_event,
                            panel_url=panel_url or None, panel_token=panel_token)
+        # Home Assistant's Assist for ovos-assist-pipeline-plugin (the pipeline
+        # plugin only sends bus messages; this link does the talking)
+        self.bus.on("ovos.assist.ping", self._assist_ping)
+        self.bus.on("ovos.assist.recognize", self._assist_recognize)
+        self.bus.on("ovos.assist.process", self._assist_process)
         # every bus message; the link sends HA only the types it asked for
         self.bus.on("message", self._from_bus)
         self.link.start()
@@ -110,6 +115,59 @@ class HALinkPlugin(PHALPlugin):
         if message.get("type"):
             self.bus.emit(Message(message["type"], message.get("data") or {},
                                   message.get("context") or {}))
+
+    # --- Home Assistant's Assist (ovos-assist-pipeline-plugin) --------------------
+
+    def _on_link_event(self, event: dict) -> None:
+        if event.get("type") in ("ready", "lost", "displaced", "removed", "pending"):
+            self.bus.emit(Message("ovos.assist.available", {"available": self.link.ready}))
+
+    def _assist_ping(self, message: Message) -> None:
+        self.bus.emit(message.reply("ovos.assist.available", {"available": self.link.ready}))
+
+    @staticmethod
+    def _ha_lang(lang: str | None) -> str | None:
+        """OVOS' da-dk -> HA's da (HA keeps a region only where it matters)."""
+        if not lang:
+            return None
+        base, _, region = lang.replace("_", "-").partition("-")
+        return f"{base}-{region.upper()}" if base in ("pt", "zh") and region else base.lower()
+
+    def _assist_recognize(self, message: Message) -> None:
+        """Does HA's own sentence matching know this one? Recognising only."""
+        data = {"match": False, "intent": None}
+        try:
+            result = self.link.call({
+                "type": "conversation/agent/homeassistant/debug",
+                "sentences": [message.data.get("utterance", "")],
+                "language": self._ha_lang(message.data.get("lang")),
+                "device_id": self.link.ha_device_id,
+            }, timeout=3)
+            found = (result or {}).get("results", [None])[0]
+            if found and found.get("match"):
+                data = {"match": True, "intent": (found.get("intent") or {}).get("name")}
+        except Exception as e:  # noqa: BLE001 - no match is the safe answer
+            LOG.debug(f"{PLUGIN}: assist recognize: {e}")
+        self.bus.emit(message.response(data))
+
+    def _assist_process(self, message: Message) -> None:
+        """HA carries it out, with its own agent (the one that recognised it)."""
+        data = {"speech": None}
+        try:
+            result = self.link.call({
+                "type": "conversation/process",
+                "text": message.data.get("utterance", ""),
+                "language": self._ha_lang(message.data.get("lang")),
+                "agent_id": "conversation.home_assistant",
+                "device_id": self.link.ha_device_id,
+            }, timeout=15)
+            response = (result or {}).get("response") or {}
+            data = {"speech": ((response.get("speech") or {}).get("plain") or {}).get("speech"),
+                    "response_type": response.get("response_type"),
+                    "conversation_id": (result or {}).get("conversation_id")}
+        except Exception as e:  # noqa: BLE001
+            LOG.warning(f"{PLUGIN}: assist process: {e}")
+        self.bus.emit(message.response(data))
 
     def shutdown(self):
         if self.link is not None:

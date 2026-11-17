@@ -75,6 +75,15 @@ Home Assistant's requests come through this link, and the plugin calls the
 panel here on the device, so the panel never has to be opened on the network.
 Restart and reboot need the panel's access token (`webui.access_token`).
 
+## Home Assistant's Assist
+
+With [ovos-assist-pipeline-plugin](https://github.com/emkay-voice/ovos-assist-pipeline-plugin)
+in OVOS' intent pipeline, what Home Assistant's Assist recognizes ("turn on
+the light in the kitchen") goes to Home Assistant through this link. The
+link answers that plugin's `ovos.assist.*` messages. Home Assistant knows
+which device asked, so it knows the room. You can use it instead of
+skill-homeassistant, with no token to set there.
+
 ## Coming
 
 - What the device sends out on the network ([#16](https://github.com/andlo/ha-ovos-integration/issues/16)).
