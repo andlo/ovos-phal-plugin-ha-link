@@ -48,6 +48,9 @@ In `mycroft.conf`:
 | `token` | a long-lived access token |
 | `name` | the device's name in Home Assistant (default: the host name) |
 | `model` | shown on the device page (default: `OpenVoiceOS`) |
+| `panel_url` | the device's [ovos-control-panel](https://github.com/OpenVoiceOS/ovos-control-panel), reached here on the device (default `http://127.0.0.1:8500`; `false` for none) |
+| `panel_token` | its access token (default: `webui.access_token` from `mycroft.conf`) |
+| `panel_public_url` | where a browser can open the panel, for "Open control panel" in Home Assistant (optional) |
 
 Restart OVOS' PHAL service. The device then appears in Home Assistant under
 **Settings → Devices & services → Discovered**. Add it there, once. The plugin
@@ -62,11 +65,18 @@ ways. What Home Assistant sends goes on the bus as it is. Of the device's own
 messages, only the types Home Assistant asks for (the `forward` list) are
 sent. It connects again by itself when Home Assistant restarts.
 
+## The control panel
+
+When [ovos-control-panel](https://github.com/OpenVoiceOS/ovos-control-panel)
+runs on the device, Home Assistant also gets what it can set: language, units,
+voice, speech to text, wake word, skills on and off, updates, restart and
+reboot ([ha-ovos-integration#15](https://github.com/andlo/ha-ovos-integration/issues/15)).
+Home Assistant's requests come through this link, and the plugin calls the
+panel here on the device, so the panel never has to be opened on the network.
+Restart and reboot need the panel's access token (`webui.access_token`).
+
 ## Coming
 
-- The device's [control panel](https://github.com/OpenVoiceOS/ovos-control-panel)
-  in Home Assistant, through this link, so the panel never has to be opened on
-  the network ([ha-ovos-integration#15](https://github.com/andlo/ha-ovos-integration/issues/15)).
 - What the device sends out on the network ([#16](https://github.com/andlo/ha-ovos-integration/issues/16)).
 - The device as an Assist satellite ([#13](https://github.com/andlo/ha-ovos-integration/issues/13)).
 

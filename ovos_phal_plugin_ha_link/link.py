@@ -24,7 +24,8 @@ RETRY_SECONDS = 10
 class HALink:
     def __init__(self, url: str, token: str, device: dict[str, Any],
                  on_bus: Callable[[dict], None],
-                 on_event: Callable[[dict], None] | None = None) -> None:
+                 on_event: Callable[[dict], None] | None = None,
+                 panel_url: str | None = None, panel_token: str | None = None) -> None:
         self.url = url.rstrip("/").replace("http", "ws", 1) + "/api/websocket"
         self.token = token
         self.device = device            # what ovos/connect says about the device
@@ -38,6 +39,10 @@ class HALink:
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run, name="ha-link", daemon=True)
         self._stopping = False
+        # the device's ovos-control-panel, which HA reaches through this link
+        self.panel_url = panel_url.rstrip("/") if panel_url else None
+        self.panel_token = panel_token
+        self._session: aiohttp.ClientSession | None = None
 
     # --- the plugin's side ------------------------------------------------
 
@@ -82,7 +87,10 @@ class HALink:
     async def _connect_once(self) -> None:
         async with aiohttp.ClientSession() as session, \
                 session.ws_connect(self.url, heartbeat=30) as ws:
-            self._ws = ws
+            self._ws, self._session = ws, session
+            device = dict(self.device)
+            if await self._panel_answers():
+                device["panel"] = True
             hello = await ws.receive_json()
             if hello.get("type") != "auth_required":
                 raise aiohttp.ClientError(f"not Home Assistant: {hello}")
@@ -93,7 +101,7 @@ class HALink:
             LOG.info(f"ha-link: logged in to Home Assistant {auth.get('ha_version')}")
             self._connect_id = next(self._ids)
             await ws.send_json({"id": self._connect_id, "type": "ovos/connect",
-                                "protocol": PROTOCOL, **self.device})
+                                "protocol": PROTOCOL, **device})
             async for raw in ws:
                 if raw.type != aiohttp.WSMsgType.TEXT:
                     continue
@@ -120,10 +128,49 @@ class HALink:
                 LOG.info(f"ha-link: ready, {len(self.forward)} message types go to Home Assistant")
             case "bus":
                 self.on_bus(event.get("message") or {})
+            case "panel":
+                self._loop.create_task(self._panel(event))
             case "displaced" | "removed":
                 self.ready = False
                 LOG.warning(f"ha-link: device {event['type']} in Home Assistant")
         self.on_event(event)
+
+    # --- the control panel (ha-ovos-integration#15) ----------------------------
+
+    async def _panel_answers(self) -> bool:
+        """Is there a control panel on this device to offer HA?"""
+        if not self.panel_url:
+            return False
+        try:
+            async with self._session.get(f"{self.panel_url}/healthz",
+                                         timeout=aiohttp.ClientTimeout(total=5)) as r:
+                return r.status == 200
+        except (aiohttp.ClientError, OSError, TimeoutError):
+            LOG.info(f"ha-link: no control panel at {self.panel_url}")
+            return False
+
+    async def _panel(self, event: dict[str, Any]) -> None:
+        """One request from HA to the panel's API, made here on the device."""
+        method = str(event.get("method", "GET")).upper()
+        path = str(event.get("path", ""))
+        status, body = 400, {"detail": "bad request"}
+        if method in ("GET", "POST", "PUT", "DELETE") and path.startswith("/") \
+                and ".." not in path and "://" not in path:
+            headers = {"Authorization": f"Bearer {self.panel_token}"} if self.panel_token else {}
+            try:
+                async with self._session.request(
+                        method, f"{self.panel_url}/api{path}", headers=headers,
+                        json=event.get("body") if method != "GET" else None,
+                        timeout=aiohttp.ClientTimeout(total=25)) as r:
+                    status = r.status
+                    try:
+                        body = await r.json(content_type=None)
+                    except ValueError:
+                        body = {"detail": (await r.text())[:500]}
+            except (aiohttp.ClientError, OSError, TimeoutError) as e:
+                status, body = 502, {"detail": f"the control panel did not answer: {e}"}
+        self._send({"type": "ovos/panel/response", "device_id": self.device["device_id"],
+                    "request_id": event.get("id"), "status": status, "body": body})
 
     def _send(self, msg: dict[str, Any]) -> None:
         if self._ws is not None and not self._ws.closed:

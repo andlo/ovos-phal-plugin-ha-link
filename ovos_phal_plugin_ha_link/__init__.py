@@ -79,7 +79,19 @@ class HALinkPlugin(PHALPlugin):
         }
         if lang:
             info["lang"] = lang
-        self.link = HALink(url, token, info, on_bus=self._from_ha)
+        # the control panel on this device, offered to HA through the link
+        panel_url = self.config.get("panel_url", "http://127.0.0.1:8500")
+        panel_token = self.config.get("panel_token")
+        if not panel_token:
+            try:
+                from ovos_config import Configuration
+                panel_token = (Configuration().get("webui") or {}).get("access_token")
+            except Exception:  # noqa: BLE001
+                panel_token = None
+        if self.config.get("panel_public_url"):
+            info["panel_url"] = self.config["panel_public_url"]
+        self.link = HALink(url, token, info, on_bus=self._from_ha,
+                           panel_url=panel_url or None, panel_token=panel_token)
         # every bus message; the link sends HA only the types it asked for
         self.bus.on("message", self._from_bus)
         self.link.start()
