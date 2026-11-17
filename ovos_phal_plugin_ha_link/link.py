@@ -30,8 +30,14 @@ class HALink:
     def __init__(self, url: str, token: str, device: dict[str, Any],
                  on_bus: Callable[[dict], None],
                  on_event: Callable[[dict], None] | None = None,
-                 panel_url: str | None = None, panel_token: str | None = None) -> None:
+                 panel_url: str | None = None, panel_token: str | None = None,
+                 on_satellite_bus: Callable[[str, dict], None] | None = None) -> None:
         self.url = url.rstrip("/").replace("http", "ws", 1) + "/api/websocket"
+        # this device's HiveMind satellites, each its own device in HA "via"
+        # this one, on this same connection (ha-ovos-integration#12):
+        # device_id -> {"info", "sub" (its ovos/connect id), "ready", "forward"}
+        self.satellites: dict[str, dict[str, Any]] = {}
+        self.on_satellite_bus = on_satellite_bus or (lambda device_id, m: None)
         self.token = token
         self.device = device            # what ovos/connect says about the device
         self.on_bus = on_bus            # a bus message from HA, for the device
@@ -66,6 +72,61 @@ class HALink:
         """A bus message for HA, if HA asked for this type (thread-safe)."""
         if self.ready and message.get("type") in self.forward:
             self._loop.call_soon_threadsafe(self._send_bus, message)
+
+    # --- satellites (thread-safe) -------------------------------------------
+
+    def add_satellite(self, info: dict[str, Any]) -> None:
+        """A satellite connected to this device: it shows up in HA too."""
+        self._loop.call_soon_threadsafe(self._add_satellite, info)
+
+    def drop_satellite(self, device_id: str, forget: bool = False) -> None:
+        """It disconnected (unavailable in HA), or was removed (forget: its
+        device goes from HA)."""
+        self._loop.call_soon_threadsafe(self._drop_satellite, device_id, forget)
+
+    def send_satellite(self, device_id: str, message: dict[str, Any]) -> None:
+        sat = self.satellites.get(device_id)
+        if sat and sat["ready"] and message.get("type") in sat["forward"]:
+            self._loop.call_soon_threadsafe(self._send, {
+                "type": "ovos/bus", "device_id": device_id,
+                "message": {"type": message["type"], "data": message.get("data") or {},
+                            "context": message.get("context") or {}}})
+
+    def _add_satellite(self, info: dict[str, Any]) -> None:
+        sat = self.satellites.setdefault(info["device_id"], {"sub": None, "ready": False,
+                                                            "forward": set()})
+        sat["info"] = {**info, "via_device": self.device["device_id"]}
+        if self.ready and sat["sub"] is None:
+            self._connect_satellite(info["device_id"])
+
+    def _connect_satellite(self, device_id: str) -> None:
+        sat = self.satellites[device_id]
+        sat["sub"], sat["ready"] = next(self._ids), False
+        self._send_raw({"id": sat["sub"], "type": "ovos/connect", "protocol": PROTOCOL,
+                        **sat["info"]})
+
+    def _drop_satellite(self, device_id: str, forget: bool) -> None:
+        sat = self.satellites.pop(device_id, None)
+        if sat is None or self._ws is None or self._ws.closed:
+            return
+        if sat["sub"] is not None:
+            self._send_raw({"id": next(self._ids), "type": "unsubscribe_events",
+                            "subscription": sat["sub"]})
+        if forget:
+            self._send({"type": "ovos/forget", "device_id": device_id})
+
+    def _satellite_event(self, device_id: str, event: dict[str, Any]) -> None:
+        sat = self.satellites.get(device_id)
+        if sat is None:
+            return
+        match event.get("type"):
+            case "ready":
+                sat["forward"], sat["ready"] = set(event.get("forward", [])), True
+                LOG.info(f"ha-link: satellite {sat['info'].get('name')} is in Home Assistant")
+            case "bus":
+                self.on_satellite_bus(device_id, event.get("message") or {})
+            case "pending" | "displaced" | "removed":
+                sat["ready"] = False
 
     def command(self, msg: dict[str, Any]) -> None:
         """Any other command for HA (thread-safe), e.g. the control panel's answers."""
@@ -106,6 +167,8 @@ class HALink:
             except PermissionError as e:
                 LOG.error(f"ha-link: {e}")
             self.ready = False
+            for sat in self.satellites.values():   # connected again after the hub
+                sat["sub"], sat["ready"] = None, False
             self.on_event({"type": "lost"})
             await asyncio.sleep(RETRY_SECONDS)
 
@@ -140,7 +203,14 @@ class HALink:
                             fut.set_exception(RuntimeError((msg.get("error") or {}).get("message", "error")))
                     continue
                 if msg.get("id") != self._connect_id:
-                    if msg.get("type") == "result" and not msg.get("success"):
+                    sat_id = next((d for d, s in self.satellites.items()
+                                   if s["sub"] == msg.get("id")), None)
+                    if sat_id is not None:
+                        if msg.get("type") == "event":
+                            self._satellite_event(sat_id, msg["event"])
+                        elif msg.get("type") == "result" and not msg.get("success"):
+                            LOG.warning(f"ha-link: HA refused satellite {sat_id}: {msg.get('error')}")
+                    elif msg.get("type") == "result" and not msg.get("success"):
                         LOG.debug(f"ha-link: HA refused a command: {msg.get('error')}")
                     continue
                 if msg.get("type") == "result" and not msg.get("success"):
@@ -160,6 +230,10 @@ class HALink:
                 self.ha_device_id = event.get("device_id")
                 self.ready = True
                 LOG.info(f"ha-link: ready, {len(self.forward)} message types go to Home Assistant")
+                # the satellites come in once their hub is there (again)
+                for device_id, sat in self.satellites.items():
+                    if sat["sub"] is None:
+                        self._connect_satellite(device_id)
             case "bus":
                 self.on_bus(event.get("message") or {})
             case "panel":
@@ -226,8 +300,11 @@ class HALink:
                 "data": base64.b64encode(data).decode()}
 
     def _send(self, msg: dict[str, Any]) -> None:
+        self._send_raw({"id": next(self._ids), **msg})
+
+    def _send_raw(self, msg: dict[str, Any]) -> None:
         if self._ws is not None and not self._ws.closed:
-            self._loop.create_task(self._ws.send_json({"id": next(self._ids), **msg}))
+            self._loop.create_task(self._ws.send_json(msg))
 
     def _send_bus(self, message: dict[str, Any]) -> None:
         self._send({"type": "ovos/bus", "device_id": self.device["device_id"],

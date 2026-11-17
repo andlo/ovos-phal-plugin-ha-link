@@ -21,10 +21,12 @@ services -> Discovered; add it there.
 """
 from __future__ import annotations
 
+import hashlib
 from importlib.metadata import PackageNotFoundError, version
 import json
 from pathlib import Path
 import socket
+from typing import Any
 import uuid
 
 from ovos_bus_client.message import Message
@@ -35,6 +37,9 @@ from ovos_utils.xdg_utils import xdg_state_home
 from .link import HALink
 
 PLUGIN = "ovos-phal-plugin-ha-link"
+# context key on what the link puts on the bus for a satellite, so it isn't
+# taken for the satellite's own answer
+SENT_BY_LINK = "ha_link"
 
 
 def _version(package: str) -> str | None:
@@ -91,7 +96,16 @@ class HALinkPlugin(PHALPlugin):
         if self.config.get("panel_public_url"):
             info["panel_url"] = self.config["panel_public_url"]
         self.link = HALink(url, token, info, on_bus=self._from_ha, on_event=self._on_link_event,
-                           panel_url=panel_url or None, panel_token=panel_token)
+                           panel_url=panel_url or None, panel_token=panel_token,
+                           on_satellite_bus=self._from_ha_for_satellite)
+        # HiveMind satellites, when this OVOS is a hivemind-core master (Emkay
+        # Home, a hub): each one becomes a device in HA, connected via this one
+        self._peers: dict[str, str] = {}        # satellite device_id -> its peer
+        self._clients: dict[str, str] = {}      # connected clients: peer without session -> device_id
+        if self.config.get("satellites", True):
+            self.bus.on("hive.client.connect", self._hive_connect)
+            self.bus.on("hive.client.disconnect", self._hive_disconnect)
+            self.bus.on("ovos.ha_link.satellite.forget", self._hive_forget)
         # Home Assistant's Assist for ovos-assist-pipeline-plugin (the pipeline
         # plugin only sends bus messages; this link does the talking)
         self.bus.on("ovos.assist.ping", self._assist_ping)
@@ -106,7 +120,17 @@ class HALinkPlugin(PHALPlugin):
             message = json.loads(raw) if isinstance(raw, str) else raw
         except ValueError:
             return
-        if isinstance(message, dict) and message.get("type"):
+        if not isinstance(message, dict) or not message.get("type"):
+            return
+        context = message.get("context") or {}
+        if context.get(SENT_BY_LINK):
+            return              # what this link put on the bus for a satellite
+        if self._clients:
+            self._learn_peer(context.get("source"))
+        satellite = self._satellite_of(context)
+        if satellite:
+            self.link.send_satellite(satellite, message)
+        else:
             self.link.send(message)
 
     def _from_ha(self, message: dict) -> None:
@@ -115,6 +139,93 @@ class HALinkPlugin(PHALPlugin):
         if message.get("type"):
             self.bus.emit(Message(message["type"], message.get("data") or {},
                                   message.get("context") or {}))
+
+    # --- HiveMind satellites (ha-ovos-integration#12) ------------------------------
+    # hivemind-core puts what a satellite sends on this bus with its peer as
+    # context["source"], and sends a satellite whatever has its peer in
+    # context["destination"]. So the link only has to tell them apart.
+
+    @staticmethod
+    def satellite_id(key: str) -> str:
+        """A satellite's device id: stable across connections (its session
+        isn't), and not its secret access key. The same 16 characters Emkay
+        Home shows for a paired Emkay."""
+        return "hm-" + hashlib.sha256(key.encode()).hexdigest()[:16]
+
+    def _satellite_of(self, context: dict) -> str | None:
+        if not self._peers:
+            return None
+        targets = context.get("destination") or []
+        targets = targets if isinstance(targets, list) else [targets]
+        for device_id, peer in self._peers.items():
+            if context.get("source") == peer or peer in targets:
+                return device_id
+        return None
+
+    # hivemind-core's peer is "<useragent>::<client id>::<name>::<session>".
+    # hive.client.connect comes before the client's HELLO, while the session is
+    # still "default"; the real one is only known from the satellite's first
+    # message. So a satellite is added to HA when it first says something
+    # (Emkay sends its volume and mic state right after connecting).
+
+    @staticmethod
+    def _client_of(peer: str) -> str:
+        return peer.rsplit("::", 1)[0]
+
+    def _hive_connect(self, message: Message) -> None:
+        peer, key = message.context.get("source"), message.data.get("key")
+        if peer and key:
+            self._clients[self._client_of(peer)] = self.satellite_id(key)
+
+    def _learn_peer(self, source: Any) -> None:
+        if not isinstance(source, str) or "::" not in source:
+            return
+        device_id = self._clients.get(self._client_of(source))
+        if device_id is None or self._peers.get(device_id) == source:
+            return
+        new = device_id not in self._peers
+        self._peers[device_id] = source
+        if new:
+            parts = source.split("::")
+            self.link.add_satellite({"device_id": device_id,
+                                     "name": (parts[2] if len(parts) >= 4 else parts[0]) or "Satellite",
+                                     "model": "HiveMind satellite",
+                                     "manufacturer": "OpenVoiceOS"})
+
+    def _hive_disconnect(self, message: Message) -> None:
+        key = message.data.get("key")
+        if not key:
+            return
+        device_id = self.satellite_id(key)
+        self._clients = {c: d for c, d in self._clients.items() if d != device_id}
+        if self._peers.pop(device_id, None):
+            self.link.drop_satellite(device_id)
+
+    def _hive_forget(self, message: Message) -> None:
+        """A satellite was removed from the hub (unpaired): its device goes
+        from HA too. data: {"key"} or {"id"}, the id as in satellite_id
+        without "hm-" (Emkay Home's client id)."""
+        sid = message.data.get("id")
+        device_id = (self.satellite_id(message.data["key"]) if message.data.get("key")
+                     else f"hm-{sid}" if sid else None)
+        if device_id:
+            self._peers.pop(device_id, None)
+            self._clients = {c: d for c, d in self._clients.items() if d != device_id}
+            self.link.drop_satellite(device_id, forget=True)
+
+    def _from_ha_for_satellite(self, device_id: str, message: dict) -> None:
+        """What HA asks of a satellite, handed to hivemind-core for that one
+        peer (hive.send.downstream). Not as the message itself on this bus:
+        then this device's own PHAL would take "mycroft.volume.set" as meant
+        for it too."""
+        peer = self._peers.get(device_id)
+        if peer and message.get("type"):
+            payload = {"type": message["type"], "data": message.get("data") or {},
+                       "context": {**(message.get("context") or {}), "source": PLUGIN,
+                                   "destination": [peer], SENT_BY_LINK: True}}
+            self.bus.emit(Message("hive.send.downstream",
+                                  {"msg_type": "bus", "peer": peer, "payload": payload},
+                                  {SENT_BY_LINK: True}))
 
     # --- Home Assistant's Assist (ovos-assist-pipeline-plugin) --------------------
 

@@ -77,6 +77,31 @@ Restart and reboot need the panel's access token (`webui.access_token`).
 The panel's backup goes to Home Assistant too (its **Take backup** button):
 as a file in one message, base64, up to about 3 MB.
 
+## A hub: HiveMind satellites in Home Assistant too
+
+When this OVOS is a HiveMind master (hivemind-core, e.g.
+[Emkay Home](https://github.com/emkay-voice/emkay-home)), its satellites
+come along: each one becomes its own device in Home Assistant, connected via
+this one, with its own volume, listening on/off, state and "say"
+([ha-ovos-integration#12](https://github.com/andlo/ha-ovos-integration/issues/12)).
+Nothing to set up on the satellites, and they don't log in to Home Assistant.
+
+- A satellite is added when it first sends something after connecting (Emkay
+  sends its volume and listening state right away), named as in hivemind-core.
+- It is unavailable while disconnected. Send `ovos.ha_link.satellite.forget`
+  with `{"key": "<its access key>"}` (or Emkay Home's `{"id": …}`) when it is
+  removed, and its device goes from Home Assistant.
+- What Home Assistant asks of a satellite goes through hivemind-core
+  (`hive.send.downstream`), so this device's own PHAL never takes it as
+  meant for itself.
+- The satellite must be allowed to answer: hivemind-core only lets the message
+  types a client is allowed onto the bus, by default little more than
+  utterances. Allow `mycroft.volume.get.response` and
+  `mycroft.mic.get_status.response` (`hivemind-core allow-msg`). Emkay Home
+  does it for its Emkays.
+
+Turn it off with `"satellites": false`.
+
 ## Home Assistant's Assist
 
 With [ovos-assist-pipeline-plugin](https://github.com/emkay-voice/ovos-assist-pipeline-plugin)
