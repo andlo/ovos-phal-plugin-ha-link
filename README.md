@@ -3,6 +3,9 @@
 An [OpenVoiceOS](https://openvoiceos.org) PHAL plugin that links the device to
 [Home Assistant](https://www.home-assistant.io).
 
+It is part of [Emkay](https://github.com/emkay-voice/emkay), and works on any
+OpenVoiceOS.
+
 The device connects to Home Assistant itself and carries its message bus both
 ways to the [OpenVoiceOS integration](https://github.com/andlo/ha-ovos-integration).
 In Home Assistant it shows up as a device, with what the bus can see and set:

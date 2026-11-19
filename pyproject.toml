@@ -24,8 +24,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/andlo/ovos-phal-plugin-ha-link"
-Issues = "https://github.com/andlo/ovos-phal-plugin-ha-link/issues"
+Homepage = "https://github.com/emkay-voice/ovos-phal-plugin-ha-link"
+Issues = "https://github.com/emkay-voice/ovos-phal-plugin-ha-link/issues"
 "Home Assistant integration" = "https://github.com/andlo/ha-ovos-integration"
 
 [project.entry-points."opm.phal"]
